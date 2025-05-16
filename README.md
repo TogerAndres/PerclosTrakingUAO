@@ -1,5 +1,5 @@
 # PerclosTrakingUAO
-# PerclosTrackingUAO
+
 
 This project implements a visual fatigue and drowsiness monitoring system based on the PERCLOS index (Percentage of Eye Closure), using MediaPipe and OpenCV. It detects blinks and signs of drowsiness in real-time through the webcam.
 
