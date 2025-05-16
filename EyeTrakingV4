@@ -1,0 +1,314 @@
+import cv2
+import mediapipe as mp
+import time
+from collections import deque
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+def automatic_brightness_and_contrast(image, clip_hist_percent=1):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hist = cv2.calcHist([gray],[0],None,[256],[0,256])
+    hist_size = len(hist)
+
+    accumulator = []
+    accumulator.append(float(hist[0]))
+    for index in range(1, hist_size):
+        accumulator.append(accumulator[index -1] + float(hist[index]))
+
+    max_value = accumulator[-1]
+    clip_hist_percent *= (max_value/100.0)
+    clip_hist_percent /= 2.0
+
+    min_gray = 0
+    while accumulator[min_gray] < clip_hist_percent:
+        min_gray += 1
+
+    max_gray = hist_size -1
+    while accumulator[max_gray] >= (max_value - clip_hist_percent):
+        max_gray -= 1
+
+    if max_gray - min_gray == 0:
+        alpha = 1.0
+    else:
+        alpha = 255 / (max_gray - min_gray)
+    beta = -min_gray * alpha
+
+    auto_result = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+    return auto_result
+
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False,
+                                  max_num_faces=1,
+                                  refine_landmarks=True,
+                                  min_detection_confidence=0.5,
+                                  min_tracking_confidence=0.5)
+
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
+def eye_aspect_ratio(eye_landmarks):
+    A = ((eye_landmarks[1][0] - eye_landmarks[5][0]) ** 2 + (eye_landmarks[1][1] - eye_landmarks[5][1]) ** 2) ** 0.5
+    B = ((eye_landmarks[2][0] - eye_landmarks[4][0]) ** 2 + (eye_landmarks[2][1] - eye_landmarks[4][1]) ** 2) ** 0.5
+    C = ((eye_landmarks[0][0] - eye_landmarks[3][0]) ** 2 + (eye_landmarks[0][1] - eye_landmarks[3][1]) ** 2) ** 0.5
+    ear = (A + B) / (2.0 * C)
+    return ear
+
+EAR_THRESHOLD = 0.25
+CONSEC_FRAMES = 3
+CLOSED_EYE_DURATION = 1.5
+SENSITIVITY = 0.5
+
+blink_count = 0
+frame_counter = 0
+closed_eye_start_time = None
+blink_timestamps = deque()
+drowsiness_count = 0
+drowsiness_active = False
+distraction_count = 0
+
+ear_history = []
+perclos_history = []
+perlook_history = []
+blink_history = []
+distraction_history = []
+timestamp_history = []
+
+# Iniciar cámara
+cap = cv2.VideoCapture(0)
+start_time = time.time()
+
+# Configuración de la interfaz
+window_width = 1280
+window_height = 720
+info_panel_width = 380
+video_width = window_width - info_panel_width
+video_height = window_height
+
+# Crear ventana principal
+cv2.namedWindow("Sistema de Detección de Fatiga", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Sistema de Detección de Fatiga", window_width, window_height)
+
+# Función para crear el panel de información
+def create_info_panel(metrics, size=(info_panel_width, window_height)):
+    panel = np.ones((size[1], size[0], 3), dtype=np.uint8) * 240  # Fondo gris claro
+    
+    # Título
+    cv2.putText(panel, "MONITOREO", (20, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 2)
+    cv2.line(panel, (20, 50), (size[0]-20, 50), (70, 70, 70), 2)
+    
+    # Métricas
+    y_pos = 100
+    for label, value in metrics.items():
+        if label.startswith("¡") or "detectada" in label:  # Alertas
+            cv2.putText(panel, label, (20, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
+                        (0, 0, 255) if "Somnolencia" in label else (0, 165, 255), 
+                        2)
+            y_pos += 50
+        else:
+            cv2.putText(panel, f"{label}:", (20, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 60, 60), 1)
+            
+            # Valor alineado a la derecha
+            text_size = cv2.getTextSize(str(value), cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)[0]
+            x_pos = size[0] - 20 - text_size[0]
+            cv2.putText(panel, str(value), (x_pos, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 1)
+            y_pos += 35
+    
+    # Línea divisoria inferior
+    y_pos = max(y_pos + 20, 400)
+    cv2.line(panel, (20, y_pos), (size[0]-20, y_pos), (70, 70, 70), 1)
+    
+    # Información de estado
+    status_text = "Estado: Monitorizando"
+    if "No se detecta rostro" in metrics:
+        status_text = "Estado: No se detecta rostro"
+    
+    cv2.putText(panel, status_text, (20, y_pos + 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 100, 0), 1)
+    
+    # Footer con instrucciones
+    cv2.putText(panel, "Presione ESC para salir", (20, size[1] - 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
+    
+    return panel
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = automatic_brightness_and_contrast(frame)
+    height, width = frame.shape[:2]
+    
+    # Redimensionar frame para mantener relación de aspecto
+    aspect_ratio = width / height
+    new_height = int(video_width / aspect_ratio)
+    if new_height > video_height:
+        new_height = video_height
+        new_width = int(new_height * aspect_ratio)
+    else:
+        new_width = video_width
+    
+    frame = cv2.resize(frame, (new_width, new_height))
+    height, width = frame.shape[:2]
+    
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(frame_rgb)
+
+    current_time = time.time() - start_time
+    timestamp_history.append(current_time)
+    
+    # Inicializar métricas y estados
+    metrics = {
+        "Parpadeos totales": 0,
+        "Frec. parpadeo": "0 /min",
+        "Somnolencias": 0,
+        "Distracciones": 0,
+        "EAR promedio": "N/A",
+        "Estado ojos": "No detectado"
+    }
+    
+    drowsiness_alert = ""
+    distraction_alert = ""
+
+    if results.multi_face_landmarks:
+        face_landmarks = results.multi_face_landmarks[0]
+        landmarks = [(int(point.x * width), int(point.y * height)) for point in face_landmarks.landmark]
+
+        left_eye = [landmarks[i] for i in LEFT_EYE]
+        right_eye = [landmarks[i] for i in RIGHT_EYE]
+
+        # Dibujar puntos de tracking de los ojos más destacados
+        for eye_points in [left_eye, right_eye]:
+            # Dibujar contorno del ojo (línea más fina)
+            for i in range(len(eye_points)):
+                cv2.line(frame, 
+                         eye_points[i], 
+                         eye_points[(i + 1) % len(eye_points)], 
+                         (0, 255, 0), 1)
+            
+            # Dibujar puntos de tracking más pequeños
+            for i, (x, y) in enumerate(eye_points):
+                cv2.circle(frame, (x, y), 1, (0, 0, 255), -1)  # Puntos rojos pequeños
+
+        left_ear = eye_aspect_ratio(left_eye)
+        right_ear = eye_aspect_ratio(right_eye)
+        avg_ear = (left_ear + right_ear) / 2.0
+        ear_history.append(avg_ear)
+
+        # Calcular centro de los ojos para visualizar
+        left_eye_center = np.mean(left_eye, axis=0).astype(int)
+        right_eye_center = np.mean(right_eye, axis=0).astype(int)
+        
+        # Detección de distracción por posición de la nariz
+        nose_x = results.multi_face_landmarks[0].landmark[1].x
+        face_centered = 0.5
+        head_turn = nose_x - face_centered
+        distracted = abs(head_turn) > 0.10
+        distraction_history.append(int(distracted))
+
+        if distracted:
+            distraction_alert = "¡Mirada desviada!"
+            distraction_count += 1
+
+        # Detección de somnolencia
+        if avg_ear < EAR_THRESHOLD:
+            frame_counter += 1
+            if closed_eye_start_time is None:
+                closed_eye_start_time = time.time()
+            else:
+                elapsed_time = time.time() - closed_eye_start_time
+                if elapsed_time >= CLOSED_EYE_DURATION * SENSITIVITY:
+                    drowsiness_alert = "Somnolencia detectada"
+                    if not drowsiness_active:
+                        drowsiness_count += 1
+                        drowsiness_active = True
+            
+            # Marcar ojos cerrados sutilmente
+            for eye_points in [left_eye, right_eye]:
+                hull = cv2.convexHull(np.array(eye_points))
+                cv2.drawContours(frame, [hull], 0, (0, 0, 255), 1)
+        else:
+            if frame_counter >= CONSEC_FRAMES:
+                blink_count += 1
+                blink_timestamps.append(time.time())
+            frame_counter = 0
+            closed_eye_start_time = None
+            drowsiness_active = False
+            metrics["Estado de los ojos"] = "Abiertos"
+
+        current = time.time()
+        while blink_timestamps and current - blink_timestamps[0] > 60:
+            blink_timestamps.popleft()
+        blink_frequency = len(blink_timestamps)
+        blink_history.append(blink_count)
+
+        closed_frames = sum(ear < EAR_THRESHOLD for ear in ear_history[-60:])
+        perclos = closed_frames / 60 if len(ear_history) >= 60 else 0
+        perlook = 1 - perclos
+        perclos_history.append(perclos)
+        perlook_history.append(perlook)
+
+        # Actualizar métricas
+        metrics["Parpadeos totales"] = blink_count
+        metrics["Frec. parpadeo"] = f"{blink_frequency} /min"
+        metrics["Somnolencias"] = drowsiness_count
+        metrics["Distracciones"] = distraction_count
+        metrics["EAR promedio"] = f"{avg_ear:.3f}"
+        metrics["Estado ojos"] = "CERRADOS" if avg_ear < EAR_THRESHOLD else "Abiertos"
+    else:
+        metrics = {"No se detecta rostro": ""}
+
+    # Crear panel de información
+    if drowsiness_alert:
+        metrics[drowsiness_alert] = ""
+    if distraction_alert:
+        metrics[distraction_alert] = ""
+    
+    info_panel = create_info_panel(metrics)
+    
+    # Crear espacio para el video en la interfaz
+    display = np.ones((window_height, window_width, 3), dtype=np.uint8) * 40  # Fondo oscuro
+    
+    # Insertar el frame de video en el lado izquierdo (centrado)
+    y_offset = (window_height - new_height) // 2
+    x_offset = (video_width - new_width) // 2
+    display[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = frame
+    
+    # Insertar el panel de información en el lado derecho
+    display[0:window_height, video_width:window_width] = info_panel
+    
+    # Agregar línea divisoria
+    cv2.line(display, (video_width, 0), (video_width, window_height), (100, 100, 100), 2)
+
+    # Mostrar resultado
+    cv2.imshow("Sistema de Detección de Fatiga", display)
+    
+    if cv2.waitKey(1) & 0xFF == 27:  # ESC para salir
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+
+# Guardar gráficas
+os.makedirs("graficas", exist_ok=True)
+
+def guardar_grafica(x, y, titulo, ylabel, nombre_archivo):
+    plt.figure(figsize=(10, 4))
+    plt.plot(x, y)
+    plt.title(titulo)
+    plt.xlabel("Tiempo (s)")
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f"graficas/{nombre_archivo}.png")
+    plt.close()
+
+guardar_grafica(timestamp_history, perclos_history, "PERCLOS en el tiempo", "PERCLOS", "perclos")
+guardar_grafica(timestamp_history, perlook_history, "PERLOOK en el tiempo", "PERLOOK", "perlook")
+guardar_grafica(timestamp_history, blink_history, "Parpadeos acumulados", "Parpadeos", "parpadeos")
+guardar_grafica(timestamp_history, distraction_history, "Distracciones en el tiempo", "Distracción (1 = sí)", "distraccion")
