@@ -25,3 +25,10 @@ Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
+
+👨‍💻 Authors
+Roger Alvarez
+
+Simon Barrera
+
+Arturo Fawcett
